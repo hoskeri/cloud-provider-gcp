@@ -33,13 +33,13 @@ type RecognizeFunc func(csr *capi.CertificateSigningRequest, x509cr *x509.Certif
 type ValidateFunc func(csr *capi.CertificateSigningRequest, x509cr *x509.CertificateRequest) (bool, error)
 type PreApproveFunc func(csr *capi.CertificateSigningRequest, x509cr *x509.CertificateRequest, label string) error
 
-var nodeClientKeyUsages = []capi.KeyUsage{
+var NodeClientKeyUsages = []capi.KeyUsage{
 	capi.UsageKeyEncipherment,
 	capi.UsageDigitalSignature,
 	capi.UsageClientAuth,
 }
 
-var nodeServerKeyUsages = []capi.KeyUsage{
+var NodeServerKeyUsages = []capi.KeyUsage{
 	capi.UsageKeyEncipherment,
 	capi.UsageDigitalSignature,
 	capi.UsageServerAuth,
@@ -240,7 +240,7 @@ func IsNodeClientCert(csr *capi.CertificateSigningRequest, x509cr *x509.Certific
 		return false
 	}
 
-	return hasExactUsages(csr, nodeClientKeyUsages)
+	return hasExactUsages(csr, NodeClientKeyUsages)
 }
 
 func IsNodeServerCert(csr *capi.CertificateSigningRequest, x509cr *x509.CertificateRequest) bool {
@@ -248,7 +248,7 @@ func IsNodeServerCert(csr *capi.CertificateSigningRequest, x509cr *x509.Certific
 		return false
 	}
 
-	if !hasExactUsages(csr, nodeServerKeyUsages) {
+	if !hasExactUsages(csr, NodeServerKeyUsages) {
 		return false
 	}
 

@@ -25,7 +25,6 @@ import (
 	"fmt"
 	"net/http"
 	"path"
-	"reflect"
 	"strings"
 
 	"github.com/google/go-tpm/tpm2"
@@ -40,6 +39,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/cloud-provider-gcp/pkg/csrmetrics"
+	"k8s.io/cloud-provider-gcp/pkg/csrutil"
 	"k8s.io/cloud-provider-gcp/pkg/nodeidentity"
 	"k8s.io/cloud-provider-gcp/pkg/tpmattest"
 	"k8s.io/klog"
@@ -58,43 +58,49 @@ const (
 // CSR attestation data.
 type gkeApprover struct {
 	ctx        *controllerContext
-	validators []csrValidator
+	validators []csrutil.Validator
 }
 
 func newGKEApprover(ctx *controllerContext) *gkeApprover {
 	// More specific validators go first.
-	validators := []csrValidator{
+	validators := []csrutil.Validator{
 		{
-			name:          "kubelet client certificate with TPM attestation and SubjectAccessReview",
-			authFlowLabel: "kubelet_client_tpm",
-			recognize:     isNodeClientCertWithAttestation,
-			validate:      validateTPMAttestation,
-			permission:    authorization.ResourceAttributes{Group: "certificates.k8s.io", Resource: "certificatesigningrequests", Verb: "create", Subresource: "nodeclient"},
-			approveMsg:    "Auto approving kubelet client certificate with TPM attestation after SubjectAccessReview.",
-
-			preApproveHook: ensureNodeMatchesMetadataOrDelete,
+			Name:           "kubelet client certificate with TPM attestation and SubjectAccessReview",
+			AuthFlowLabel:  "kubelet_client_tpm",
+			Recognize:      ctx.isNodeClientCertWithAttestation,
+			Validate:       ctx.validateTPMAttestation,
+			Permission:     authorization.ResourceAttributes{Group: "certificates.k8s.io", Resource: "certificatesigningrequests", Verb: "create", Subresource: "nodeclient"},
+			ApproveMsg:     "Auto approving kubelet client certificate with TPM attestation after SubjectAccessReview.",
+			PreApproveHook: ctx.ensureNodeMatchesMetadataOrDelete,
 		},
 		{
-			name:          "kubelet server certificate SubjectAccessReview",
-			authFlowLabel: "kubelet_server_self",
-			recognize:     isNodeServerCert,
-			validate:      validateNodeServerCert,
-			permission:    authorization.ResourceAttributes{Group: "certificates.k8s.io", Resource: "certificatesigningrequests", Verb: "create", Subresource: "selfnodeclient"},
-			approveMsg:    "Auto approving kubelet server certificate after SubjectAccessReview.",
+			Name:          "kubelet server certificate SubjectAccessReview",
+			AuthFlowLabel: "kubelet_server_self",
+			Recognize:     csrutil.IsNodeServerCert,
+			Validate:      ctx.validateNodeServerCert,
+			Permission:    authorization.ResourceAttributes{Group: "certificates.k8s.io", Resource: "certificatesigningrequests", Verb: "create", Subresource: "selfnodeclient"},
+			ApproveMsg:    "Auto approving kubelet server certificate after SubjectAccessReview.",
 		},
 	}
 	if ctx.csrApproverAllowLegacyKubelet {
-		validators = append(validators, csrValidator{
-			name:          "kubelet client certificate SubjectAccessReview",
-			authFlowLabel: "kubelet_client_legacy",
-			recognize:     isLegacyNodeClientCert,
-			permission:    authorization.ResourceAttributes{Group: "certificates.k8s.io", Resource: "certificatesigningrequests", Verb: "create", Subresource: "nodeclient"},
-			approveMsg:    "Auto approving kubelet client certificate after SubjectAccessReview.",
-
-			preApproveHook: ensureNodeMatchesMetadataOrDelete,
+		validators = append(validators, csrutil.Validator{
+			Name:           "kubelet client certificate SubjectAccessReview",
+			AuthFlowLabel:  "kubelet_client_legacy",
+			Recognize:      isLegacyNodeClientCert,
+			Permission:     authorization.ResourceAttributes{Group: "certificates.k8s.io", Resource: "certificatesigningrequests", Verb: "create", Subresource: "nodeclient"},
+			ApproveMsg:     "Auto approving kubelet client certificate after SubjectAccessReview.",
+			PreApproveHook: ctx.ensureNodeMatchesMetadataOrDelete,
 		})
 	}
 	return &gkeApprover{ctx: ctx, validators: validators}
+}
+
+func isLegacyNodeClientCert(csr *capi.CertificateSigningRequest, x509cr *x509.CertificateRequest) bool {
+	if !csrutil.IsNodeClientCert(csr, x509cr) {
+		return false
+	}
+
+	return csr.Spec.Username == legacyKubeletUsername
 }
 
 func (a *gkeApprover) handle(csr *capi.CertificateSigningRequest) error {
@@ -115,45 +121,45 @@ func (a *gkeApprover) handle(csr *capi.CertificateSigningRequest) error {
 
 	var tried []string
 	for _, r := range a.validators {
-		recordValidatorMetric := csrmetrics.ApprovalStartRecorder(r.authFlowLabel)
-		if !r.recognize(a.ctx, csr, x509cr) {
+		recordValidatorMetric := csrmetrics.ApprovalStartRecorder(r.AuthFlowLabel)
+		if !r.Recognize(csr, x509cr) {
 			continue
 		}
-		klog.Infof("validator %q: matched CSR %q", r.name, csr.Name)
-		tried = append(tried, r.name)
-		if r.validate != nil {
-			ok, err := r.validate(a.ctx, csr, x509cr)
+		klog.Infof("validator %q: matched CSR %q", r.Name, csr.Name)
+		tried = append(tried, r.Name)
+		if r.Validate != nil {
+			ok, err := r.Validate(csr, x509cr)
 			if err != nil {
 				return fmt.Errorf("validating CSR %q: %v", csr.Name, err)
 			}
 			if !ok {
-				klog.Infof("validator %q: denied CSR %q", r.name, csr.Name)
+				klog.Infof("validator %q: denied CSR %q", r.Name, csr.Name)
 				recordValidatorMetric(csrmetrics.ApprovalStatusDeny)
-				return a.updateCSR(csr, false, r.denyMsg)
+				return a.updateCSR(csr, false, r.DenyMsg)
 			}
 		}
 		klog.Infof("CSR %q validation passed", csr.Name)
 
-		approved, err := a.authorizeSAR(csr, r.permission)
+		approved, err := a.authorizeSAR(csr, r.Permission)
 		if err != nil {
 			recordValidatorMetric(csrmetrics.ApprovalStatusSARError)
 			return err
 		}
 		if !approved {
-			klog.Warningf("validator %q: SubjectAccessReview denied for CSR %q", r.name, csr.Name)
+			klog.Warningf("validator %q: SubjectAccessReview denied for CSR %q", r.Name, csr.Name)
 			continue
 		}
-		klog.Infof("validator %q: SubjectAccessReview approved for CSR %q", r.name, csr.Name)
-		if r.preApproveHook != nil {
-			if err := r.preApproveHook(a.ctx, csr, x509cr, r.authFlowLabel); err != nil {
-				klog.Warningf("validator %q: preApproveHook failed for CSR %q: %v", r.name, csr.Name, err)
+		klog.Infof("validator %q: SubjectAccessReview approved for CSR %q", r.Name, csr.Name)
+		if r.PreApproveHook != nil {
+			if err := r.PreApproveHook(csr, x509cr, r.AuthFlowLabel); err != nil {
+				klog.Warningf("validator %q: preApproveHook failed for CSR %q: %v", r.Name, csr.Name, err)
 				recordValidatorMetric(csrmetrics.ApprovalStatusPreApproveHookError)
 				return err
 			}
-			klog.Infof("validator %q: preApproveHook passed for CSR %q", r.name, csr.Name)
+			klog.Infof("validator %q: preApproveHook passed for CSR %q", r.Name, csr.Name)
 		}
 		recordValidatorMetric(csrmetrics.ApprovalStatusApprove)
-		return a.updateCSR(csr, true, r.approveMsg)
+		return a.updateCSR(csr, true, r.ApproveMsg)
 	}
 
 	if len(tried) != 0 {
@@ -186,37 +192,6 @@ func (a *gkeApprover) updateCSR(csr *capi.CertificateSigningRequest, approved bo
 	return nil
 }
 
-type recognizeFunc func(ctx *controllerContext, csr *capi.CertificateSigningRequest, x509cr *x509.CertificateRequest) bool
-type validateFunc func(ctx *controllerContext, csr *capi.CertificateSigningRequest, x509cr *x509.CertificateRequest) (bool, error)
-type preApproveHookFunc func(ctx *controllerContext, csr *capi.CertificateSigningRequest, x509cr *x509.CertificateRequest, metricsLabel string) error
-
-type csrValidator struct {
-	name          string
-	authFlowLabel string
-	approveMsg    string
-	denyMsg       string
-
-	// recognize is a required field that returns true if this csrValidator is
-	// applicable to given CSR.
-	recognize recognizeFunc
-	// validate is an optional field that returns true whether CSR should be
-	// approved or denied.
-	// If validate returns an error, CSR will be retried.
-	// If validate returns (false, nil), CSR is denied immediately.
-	// If validate returns (true, nil), CSR proceeds to SubjectAccessReview
-	// check.
-	//
-	// validate should only return errors for temporary problems.
-	validate validateFunc
-
-	permission authorization.ResourceAttributes
-
-	// preApproveHook is an optional function that runs immediately before a CSR is approved (after recognize/validate/permission checks have passed).
-	// If preApproveHook returns an error, the CSR will be retried.
-	// If preApproveHook returns no error, the CSR will be approved.
-	preApproveHook preApproveHookFunc
-}
-
 func (a *gkeApprover) authorizeSAR(csr *capi.CertificateSigningRequest, rattrs authorization.ResourceAttributes) (bool, error) {
 	extra := make(map[string]authorization.ExtraValue)
 	for k, v := range csr.Spec.Extra {
@@ -239,79 +214,10 @@ func (a *gkeApprover) authorizeSAR(csr *capi.CertificateSigningRequest, rattrs a
 	return sar.Status.Allowed, nil
 }
 
-func hasExactUsages(csr *capi.CertificateSigningRequest, usages []capi.KeyUsage) bool {
-	if len(usages) != len(csr.Spec.Usages) {
-		return false
-	}
-
-	usageMap := map[capi.KeyUsage]struct{}{}
-	for _, u := range usages {
-		usageMap[u] = struct{}{}
-	}
-
-	for _, u := range csr.Spec.Usages {
-		if _, ok := usageMap[u]; !ok {
-			return false
-		}
-	}
-
-	return true
-}
-
-var (
-	kubeletClientUsages = []capi.KeyUsage{
-		capi.UsageKeyEncipherment,
-		capi.UsageDigitalSignature,
-		capi.UsageClientAuth,
-	}
-	kubeletServerUsages = []capi.KeyUsage{
-		capi.UsageKeyEncipherment,
-		capi.UsageDigitalSignature,
-		capi.UsageServerAuth,
-	}
-)
-
-func isNodeCert(_ *controllerContext, _ *capi.CertificateSigningRequest, x509cr *x509.CertificateRequest) bool {
-	if !reflect.DeepEqual([]string{"system:nodes"}, x509cr.Subject.Organization) {
-		return false
-	}
-	if len(x509cr.EmailAddresses) > 0 {
-		return false
-	}
-	return strings.HasPrefix(x509cr.Subject.CommonName, "system:node:")
-}
-
-func isNodeClientCert(ctx *controllerContext, csr *capi.CertificateSigningRequest, x509cr *x509.CertificateRequest) bool {
-	if !isNodeCert(ctx, csr, x509cr) {
-		return false
-	}
-	if len(x509cr.DNSNames) > 0 || len(x509cr.IPAddresses) > 0 {
-		return false
-	}
-	return hasExactUsages(csr, kubeletClientUsages)
-}
-
-func isLegacyNodeClientCert(ctx *controllerContext, csr *capi.CertificateSigningRequest, x509cr *x509.CertificateRequest) bool {
-	if !isNodeClientCert(ctx, csr, x509cr) {
-		return false
-	}
-	return csr.Spec.Username == legacyKubeletUsername
-}
-
-func isNodeServerCert(ctx *controllerContext, csr *capi.CertificateSigningRequest, x509cr *x509.CertificateRequest) bool {
-	if !isNodeCert(ctx, csr, x509cr) {
-		return false
-	}
-	if !hasExactUsages(csr, kubeletServerUsages) {
-		return false
-	}
-	return csr.Spec.Username == x509cr.Subject.CommonName
-}
-
 // Only check that IPs in SAN match an existing VM in the project.
 // Username was already checked against CN, so this CSR is coming from
 // authenticated kubelet.
-func validateNodeServerCert(ctx *controllerContext, csr *capi.CertificateSigningRequest, x509cr *x509.CertificateRequest) (bool, error) {
+func (ctx *controllerContext) validateNodeServerCert(csr *capi.CertificateSigningRequest, x509cr *x509.CertificateRequest) (bool, error) {
 	switch {
 	case len(x509cr.IPAddresses) == 0:
 		klog.Infof("deny CSR %q: no SAN IPs", csr.Name)
@@ -359,8 +265,8 @@ var tpmAttestationBlocks = []string{
 	"ATTESTATION SIGNATURE",
 }
 
-func isNodeClientCertWithAttestation(ctx *controllerContext, csr *capi.CertificateSigningRequest, x509cr *x509.CertificateRequest) bool {
-	if !isNodeClientCert(ctx, csr, x509cr) {
+func (ctx *controllerContext) isNodeClientCertWithAttestation(csr *capi.CertificateSigningRequest, x509cr *x509.CertificateRequest) bool {
+	if !csrutil.IsNodeClientCert(csr, x509cr) {
 		return false
 	}
 	if csr.Spec.Username != tpmKubeletUsername {
@@ -379,7 +285,7 @@ func isNodeClientCertWithAttestation(ctx *controllerContext, csr *capi.Certifica
 	return true
 }
 
-func validateTPMAttestation(ctx *controllerContext, csr *capi.CertificateSigningRequest, x509cr *x509.CertificateRequest) (bool, error) {
+func (ctx *controllerContext) validateTPMAttestation(csr *capi.CertificateSigningRequest, x509cr *x509.CertificateRequest) (bool, error) {
 	blocks, err := parsePEMBlocks(csr.Spec.Request)
 	if err != nil {
 		klog.Infof("deny CSR %q: parsing csr.Spec.Request: %v", csr.Name, err)
@@ -623,7 +529,8 @@ func isNotFound(err error) bool {
 	return ok && gerr.Code == http.StatusNotFound
 }
 
-func ensureNodeMatchesMetadataOrDelete(ctx *controllerContext, csr *capi.CertificateSigningRequest, x509cr *x509.CertificateRequest, metricsLabel string) error {
+func (ctx *controllerContext) ensureNodeMatchesMetadataOrDelete(csr *capi.CertificateSigningRequest, x509cr *x509.CertificateRequest, metricsLabel string) error {
+
 	// TODO: short-circuit
 	recordMetric := csrmetrics.ApprovalStartRecorder(metricsLabel)
 	if !strings.HasPrefix(x509cr.Subject.CommonName, "system:node:") {

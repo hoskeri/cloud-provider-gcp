@@ -47,63 +47,18 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
 	testclient "k8s.io/client-go/testing"
+	csrutil "k8s.io/cloud-provider-gcp/pkg/csrutil"
 	"k8s.io/cloud-provider-gcp/pkg/nodeidentity"
 	"k8s.io/cloud-provider-gcp/pkg/tpmattest"
 	"k8s.io/klog"
 	certutil "k8s.io/kubernetes/pkg/apis/certificates/v1beta1"
 )
 
+var _ = csrutil.Validator{}
+
 func init() {
 	// Make sure we get all useful output in stderr.
 	klog.SetOutput(os.Stderr)
-}
-
-func TestHasKubeletUsages(t *testing.T) {
-	cases := []struct {
-		usages   []capi.KeyUsage
-		expected bool
-	}{
-		{
-			usages:   nil,
-			expected: false,
-		},
-		{
-			usages:   []capi.KeyUsage{},
-			expected: false,
-		},
-		{
-			usages: []capi.KeyUsage{
-				capi.UsageKeyEncipherment,
-				capi.UsageDigitalSignature,
-			},
-			expected: false,
-		},
-		{
-			usages: []capi.KeyUsage{
-				capi.UsageKeyEncipherment,
-				capi.UsageDigitalSignature,
-				capi.UsageServerAuth,
-			},
-			expected: false,
-		},
-		{
-			usages: []capi.KeyUsage{
-				capi.UsageKeyEncipherment,
-				capi.UsageDigitalSignature,
-				capi.UsageClientAuth,
-			},
-			expected: true,
-		},
-	}
-	for _, c := range cases {
-		if hasExactUsages(&capi.CertificateSigningRequest{
-			Spec: capi.CertificateSigningRequestSpec{
-				Usages: c.usages,
-			},
-		}, kubeletClientUsages) != c.expected {
-			t.Errorf("unexpected result of hasKubeletUsages(%v), expecting: %v", c.usages, c.expected)
-		}
-	}
 }
 
 func TestHandle(t *testing.T) {
@@ -139,9 +94,9 @@ func TestHandle(t *testing.T) {
 		allowed        bool
 		recognized     bool
 		err            bool
-		validate       validateFunc
+		validate       csrutil.ValidateFunc
 		verifyActions  func(*testing.T, []testclient.Action)
-		preApproveHook preApproveHookFunc
+		preApproveHook csrutil.PreApproveFunc
 	}{
 		{
 			desc:       "not recognized not allowed",
@@ -185,7 +140,7 @@ func TestHandle(t *testing.T) {
 			recognized:    true,
 			allowed:       true,
 			verifyActions: verifyCreateAndUpdate,
-			preApproveHook: func(_ *controllerContext, _ *capi.CertificateSigningRequest, _ *x509.CertificateRequest, _ string) error {
+			preApproveHook: func(_ *capi.CertificateSigningRequest, _ *x509.CertificateRequest, _ string) error {
 				return nil
 			},
 		},
@@ -199,7 +154,7 @@ func TestHandle(t *testing.T) {
 				}
 				_ = as[0].(testclient.CreateActionImpl)
 			},
-			preApproveHook: func(_ *controllerContext, _ *capi.CertificateSigningRequest, _ *x509.CertificateRequest, _ string) error {
+			preApproveHook: func(_ *capi.CertificateSigningRequest, _ *x509.CertificateRequest, _ string) error {
 				return fmt.Errorf("preApproveHook failed")
 			},
 			err: true,
@@ -208,7 +163,7 @@ func TestHandle(t *testing.T) {
 			desc:       "recognized, allowed and validated",
 			recognized: true,
 			allowed:    true,
-			validate: func(ctx *controllerContext, csr *capi.CertificateSigningRequest, x509cr *x509.CertificateRequest) (bool, error) {
+			validate: func(csr *capi.CertificateSigningRequest, x509cr *x509.CertificateRequest) (bool, error) {
 				return true, nil
 			},
 			verifyActions: verifyCreateAndUpdate,
@@ -217,7 +172,7 @@ func TestHandle(t *testing.T) {
 			desc:       "recognized, allowed but not validated",
 			recognized: true,
 			allowed:    true,
-			validate: func(ctx *controllerContext, csr *capi.CertificateSigningRequest, x509cr *x509.CertificateRequest) (bool, error) {
+			validate: func(csr *capi.CertificateSigningRequest, x509cr *x509.CertificateRequest) (bool, error) {
 				return false, nil
 			},
 			verifyActions: func(t *testing.T, as []testclient.Action) {
@@ -251,7 +206,7 @@ func TestHandle(t *testing.T) {
 			desc:       "recognized, allowed but validation failed",
 			recognized: true,
 			allowed:    true,
-			validate: func(ctx *controllerContext, csr *capi.CertificateSigningRequest, x509cr *x509.CertificateRequest) (bool, error) {
+			validate: func(csr *capi.CertificateSigningRequest, x509cr *x509.CertificateRequest) (bool, error) {
 				return false, errors.New("failed")
 			},
 			verifyActions: func(t *testing.T, as []testclient.Action) {
@@ -273,18 +228,18 @@ func TestHandle(t *testing.T) {
 					},
 				}, nil
 			})
-			validator := csrValidator{
-				approveMsg: "tester",
-				permission: authorization.ResourceAttributes{Group: "foo", Resource: "bar", Subresource: "baz"},
-				recognize: func(ctx *controllerContext, csr *capi.CertificateSigningRequest, x509cr *x509.CertificateRequest) bool {
+			validator := csrutil.Validator{
+				ApproveMsg: "tester",
+				Permission: authorization.ResourceAttributes{Group: "foo", Resource: "bar", Subresource: "baz"},
+				Recognize: func(csr *capi.CertificateSigningRequest, x509cr *x509.CertificateRequest) bool {
 					return c.recognized
 				},
-				validate:       c.validate,
-				preApproveHook: c.preApproveHook,
+				Validate:       c.validate,
+				PreApproveHook: c.preApproveHook,
 			}
 			approver := gkeApprover{
 				ctx:        &controllerContext{client: client},
-				validators: []csrValidator{validator},
+				validators: []csrutil.Validator{validator},
 			}
 			csr := makeTestCSR(t)
 			if err := approver.handle(csr); err != nil && !c.err {
@@ -317,15 +272,15 @@ func TestValidators(t *testing.T) {
 			},
 			func(b *csrBuilder, c *controllerContext) {
 				goodCase(b, c)
-				b.usages = kubeletServerUsages
+				b.usages = csrutil.NodeServerKeyUsages
 			},
 		}
 		testValidator(t, "bad", badCases, isLegacyNodeClientCert, false)
 	})
 	t.Run("isNodeServerClient", func(t *testing.T) {
-		goodCase := func(b *csrBuilder, _ *controllerContext) { b.usages = kubeletServerUsages }
+		goodCase := func(b *csrBuilder, _ *controllerContext) { b.usages = csrutil.NodeServerKeyUsages }
 		goodCases := []func(*csrBuilder, *controllerContext){goodCase}
-		testValidator(t, "good", goodCases, isNodeServerCert, true)
+		testValidator(t, "good", goodCases, csrutil.IsNodeServerCert, true)
 
 		badCases := []func(*csrBuilder, *controllerContext){
 			func(b *csrBuilder, c *controllerContext) {},
@@ -350,7 +305,7 @@ func TestValidators(t *testing.T) {
 				b.cn = "system:node:bar"
 			},
 		}
-		testValidator(t, "bad", badCases, isNodeServerCert, false)
+		testValidator(t, "bad", badCases, csrutil.IsNodeServerCert, false)
 	})
 	t.Run("validateNodeServerCertInner", func(t *testing.T) {
 		client, srv := fakeGCPAPI(t, nil)
@@ -361,7 +316,7 @@ func TestValidators(t *testing.T) {
 				t.Fatalf("creating GCE API client: %v", err)
 			}
 			ctx.gcpCfg.Compute = cs
-			ok, err := validateNodeServerCert(ctx, csr, x509cr)
+			ok, err := ctx.validateNodeServerCert(csr, x509cr)
 			if err != nil {
 				t.Fatalf("validateNodeServerCert: %v", err)
 			}
@@ -413,7 +368,7 @@ func TestValidators(t *testing.T) {
 		testValidator(t, "bad", cases, fn, false)
 	})
 	t.Run("isNodeClientCertWithAttestation", func(t *testing.T) {
-		goodCase := func(b *csrBuilder, _ *controllerContext) {
+		goodCase := func(b *csrBuilder, c *controllerContext) {
 			b.requestor = tpmKubeletUsername
 			for _, name := range tpmAttestationBlocks {
 				b.extraPEM[name] = []byte("foo")
@@ -445,7 +400,7 @@ func TestValidators(t *testing.T) {
 				b.orgs = []string{"system:master"}
 			},
 		}
-		testValidator(t, "bad", badCases, isNodeClientCertWithAttestation, false)
+		testValidator(t, "bad", badCases, ctx.isNodeClientCertWithAttestation, false)
 	})
 	t.Run("validateTPMAttestation with cert", func(t *testing.T) {
 		// TODO(awly): re-enable this when ATTESTATION CERTIFICATE is used.
@@ -457,7 +412,7 @@ func TestValidators(t *testing.T) {
 		defer srv.Close()
 
 		validateFunc := func(ctx *controllerContext, csr *capi.CertificateSigningRequest, x509cr *x509.CertificateRequest) bool {
-			ok, err := validateTPMAttestation(ctx, csr, x509cr)
+			ok, err := ctx.validateTPMAttestation(csr, x509cr)
 			if err != nil {
 				t.Logf("validateTPMAttestation failed with %q", err)
 			}
@@ -565,7 +520,7 @@ func TestValidators(t *testing.T) {
 		defer gkeSrv.Close()
 
 		validateFunc := func(ctx *controllerContext, csr *capi.CertificateSigningRequest, x509cr *x509.CertificateRequest) bool {
-			ok, err := validateTPMAttestation(ctx, csr, x509cr)
+			ok, err := ctx.validateTPMAttestation(csr, x509cr)
 			if err != nil {
 				t.Logf("validateTPMAttestation failed with %q", err)
 			}
@@ -708,7 +663,9 @@ func TestValidators(t *testing.T) {
 	})
 }
 
-func testValidator(t *testing.T, desc string, cases []func(b *csrBuilder, c *controllerContext), checkFunc recognizeFunc, want bool) {
+type checkFuncType func(c *controllerContext, csr *csr.CertificateSigningRequest, x509cr *x509.CertificateRequest) bool
+
+func testValidator(t *testing.T, desc string, cases []func(b *csrBuilder, c *controllerContext), checkFunc checkFuncType, want bool) {
 	t.Helper()
 	for i, c := range cases {
 		pk, err := ecdsa.GenerateKey(elliptic.P224(), insecureRand)
@@ -719,7 +676,7 @@ func testValidator(t *testing.T, desc string, cases []func(b *csrBuilder, c *con
 			cn:        "system:node:foo",
 			orgs:      []string{"system:nodes"},
 			requestor: "system:node:foo",
-			usages:    kubeletClientUsages,
+			usages:    csrutil.NodeClientKeyUsages,
 			extraPEM:  make(map[string][]byte),
 			key:       pk,
 		}
